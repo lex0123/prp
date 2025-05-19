@@ -1,96 +1,213 @@
-from pymongo import MongoClient
-import numpy as np
-import faiss
-from openai import OpenAI
-import json
-from bs4 import BeautifulSoup
 import requests
-import chardet
+from bs4 import BeautifulSoup
+import os
+import time
+import random
+import re
+import concurrent.futures
+from urllib.parse import urljoin
+# 添加数据库模块导入
+import sqlite3
+from datetime import datetime
 
-# 连接到 MongoDB 数据库
-client1 = MongoClient("mongodb://localhost:27017/")
-db = client1["knowledge_database"]
-collection = db["entities"]
-dimension = 10  # 嵌入向量的维度
-index = faiss.IndexFlatL2(dimension)
-
-# 定义嵌入向量生成函数
-def generate_embeddings(texts):
-    client = OpenAI(api_key="sk-57985661b21e4faf8eb0510447972368", base_url="https://api.deepseek.com")  # 替换为您的 DeepSeek API 密钥
-    embeddings = []
-    target_dimension = 10  # 假设目标维度为 10
-    for text in texts:
-        print(text)
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "转化为10维嵌入向量,只需要输出单个向量,不需要打印任何其他信息"},
-                {"role": "user", "content": f"转化为10维嵌入向量,只需要输出单个嵌入式向量,不需要打印任何其他信息: {text}"}
-            ],
-            stream=False
-        )
-        embedding = response.choices[0].message.content
-        print("API 返回的嵌入内容:", embedding)
-        try:
-            # 使用 JSON 解析嵌入向量
-            embedding_vector = np.array(json.loads(embedding))
-            # 检查是否为有效的数值数组
-            if not np.issubdtype(embedding_vector.dtype, np.number):
-                raise ValueError("嵌入向量包含非法值")
-            # 调整向量维度为目标维度
-            if len(embedding_vector) > target_dimension:
-                embedding_vector = embedding_vector[:target_dimension]  # 截断多余部分
-            elif len(embedding_vector) < target_dimension:
-                embedding_vector = np.pad(embedding_vector, (0, target_dimension - len(embedding_vector)), mode='constant')  # 填充0
-            embeddings.append(embedding_vector)
-        except Exception as e:
-            print("解析嵌入向量失败:", e)
-            print("原始嵌入内容:", embedding)
-            continue
-    return np.array(embeddings)
-
-
-# 获取网页内容
-print("请输入需要增加关系的网页地址:")
-url = input()
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
-response = requests.get(url, headers=headers)
-response.encoding = response.apparent_encoding  
-context = response.text
-
-# 提取人物关系并生成数据
-query = "从提取中的网页内容中提取出人物关系,并将其转化为知识库中的数据格式。人物关系的格式为:人物1 关联关系 人物2,如参加大会X的名单有:A,B,C...,那么A,B,C之间都添加\
-    关系,这个关系形式是A 共同参加大会X B,输出格式为[{\"人物1\": \"A\", \"关联关系\": \"X\", \"人物2\": \"B\"}...],只需要输出输出格式要求内容就可以,以纯文本形式输出,不需要以json格式输出,注意外面加上[],不需要输出其他的任何东西"
-client = OpenAI(api_key="sk-57985661b21e4faf8eb0510447972368", base_url="https://api.deepseek.com")
-response = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[
-        {"role": "system", "content": "你是一个知识问答助手,基于提供的上下文回答问题。"},
-        {"role": "user", "content": f"上下文: {context}\n问题: {query}"}
-    ],
-    stream=False
-)
-
-try:
-    # 解析返回的数据
-    data = json.loads(response.choices[0].message.content)
+class NewsCrawler:
+    def __init__(self, base_url, save_dir="corpus", db_path=None):
+        self.base_url = base_url
+        self.save_dir = save_dir
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        self.all_news_links = []
+        
+        # 创建保存目录
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            
+        # 初始化数据库
+        if db_path is None:
+            self.db_path = os.path.join(save_dir, "corpus.db")
+        else:
+            self.db_path = db_path
+        
+        self.init_database()
     
-    print("标准化后的数据:", data)
-    # 插入到 MongoDB 数据库
-    collection.insert_many(data)
-    print("数据已成功插入知识库！")
-    # 为每条数据生成嵌入向量并更新 FAISS 索引
-    documents = [f"{row['人物1']} {row['关联关系']} {row['人物2']}" for row in data]
-    print("文档数据:", documents)
-    embeddings = generate_embeddings(data)
-    print("嵌入向量:", embeddings)
-    index.add(embeddings.astype('float32'))
-    print("嵌入向量已成功添加到 FAISS 索引！")
-    # 保存 FAISS 索引
-    faiss.write_index(index, "vector_index.faiss")
-    print("FAISS 索引已保存！")
-except json.JSONDecodeError as e:
-    print("解析 JSON 数据失败:", e)
+    def init_database(self):
+        """初始化SQLite数据库"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 创建新闻表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS news (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            content TEXT
+        )
+        ''')
+        
+        # 创建索引
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_title ON news (title)')    
+        conn.commit()
+        conn.close()
+        print(f"数据库已初始化：{self.db_path}")
+    
+    def get_news_links(self, page_url):
+        try:
+            response = requests.get(page_url, headers=self.headers, timeout=10)
+            response.encoding = 'utf-8'
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 查找所有的新闻项
+            news_items = soup.select('li.item a.card')
+            news_links = []
+            
+            # 正确获取基础域名
+            base_domain = "https://news.sjtu.edu.cn"
+            
+            print(f"找到 {len(news_items)} 个新闻项")
+            for item in news_items:
+                link = item.get('href')
+                if link:
+                    # 提取相对链接，例如 /jdyw/20250515/210548.html
+                    print(f"发现链接: {link}")
+                    
+                    # 处理相对链接
+                    if not link.startswith('http'):
+                        # 使用urljoin正确拼接URL
+                        full_link = urljoin(base_domain, link)
+                        news_links.append(full_link)
+                    else:
+                        news_links.append(link)
+                
+            return news_links
+        
+        except Exception as e:
+            print(f"获取新闻列表出错: {e}")
+            return []
+    
+    def get_news_content(self, news_url):
+        try:
+            response = requests.get(news_url, headers=self.headers, timeout=10)
+            response.encoding = 'utf-8'
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 提取标题
+            title = soup.select_one('title').text.strip() if soup.select_one('title') else "无标题"
+            # 提取内容
+            content_elements = soup.select('div.Article_content p')
+            content = '\n'.join([p.text.strip() for p in content_elements if p.text.strip()])
+            
+            return title, content
+        
+        except Exception as e:
+            print(f"获取新闻内容出错 {news_url}: {e}")
+            return "获取失败", "内容获取失败", "", ""
+    
+    def save_to_corpus(self, title, content, news_url, file_index):
+        """保存新闻内容到语料库文件和数据库，确保标题唯一
+        
+        Args:
+            title: 新闻标题
+            content: 新闻正文
+            news_url: 新闻URL
+            file_index: 文件索引
+        """
+        file_path = os.path.join(self.save_dir, f"news_{file_index}.txt")
 
+        # 始终保存到文本文件
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(f"标题: {title}\n")
+            f.write(f"来源URL: {news_url}\n")
+            f.write(f"正文内容:\n{content}\n")
+
+        # 添加数据库插入代码
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # 检查标题是否已存在
+            cursor.execute("SELECT COUNT(*) FROM news WHERE title = ?", (title,))
+            exists = cursor.fetchone()[0] > 0
+            
+            if not exists:
+                # 标题不存在，插入新记录
+                cursor.execute(
+                    "INSERT INTO news (title, content) VALUES (?, ?)",
+                    (title, content)
+                )
+                
+                # 提交事务并关闭连接
+                conn.commit()
+                print(f"新闻 #{file_index} '{title[:20]}...' 已保存到数据库")
+            else:
+                print(f"跳过重复标题: '{title[:20]}...'")
+            
+            conn.close()
+        except Exception as e:
+            print(f"保存到数据库出错: {e}")
+    def process_news(self, args):
+        link, index = args
+        try:
+            print(f"正在爬取第 {index + 1} 条新闻: {link}")
+            title, content= self.get_news_content(link)
+            
+            if content != "内容获取失败":
+                self.save_to_corpus(title, content, link, index + 1)
+                # 添加随机延时，防止被封IP
+                sleep_time = random.uniform(0.5, 1.5)
+                time.sleep(sleep_time)
+                return True
+        except Exception as e:
+            print(f"处理新闻出错 {link}: {e}")
+        
+        return False
+    
+    def crawl(self, start_page=2, end_page=2, max_news=500, max_workers=10):
+        # 先获取所有页面的新闻链接
+        for page in range(start_page, end_page + 1):
+            page_url = self.base_url.format(i=page)
+            print(f"正在获取第 {page} 页的新闻列表: {page_url}")
+            
+            news_links = self.get_news_links(page_url)
+            print(f"在第 {page} 页找到 {len(news_links)} 条新闻链接")
+            self.all_news_links.extend(news_links)
+        
+        # 打印所有收集到的新闻链接
+        print("\n====== 所有新闻网站链接 ======")
+        for i, link in enumerate(self.all_news_links):
+            print(f"{i+1}. {link}")
+        print("============================\n")
+        
+        # 限制最大新闻数量
+        if len(self.all_news_links) > max_news:
+            self.all_news_links = self.all_news_links[:max_news]
+            print(f"已限制新闻数量为 {max_news} 条")
+        
+        # 准备线程池参数
+        args_list = [(link, i) for i, link in enumerate(self.all_news_links)]
+        
+        # 使用线程池处理新闻
+        total_news = len(args_list)
+        successful_news = 0
+        
+        print(f"\n开始使用线程池爬取新闻，总数: {total_news}，最大线程数: {max_workers}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(self.process_news, args_list))
+            successful_news = results.count(True)
+        
+        print(f"\n爬取完成，成功获取 {successful_news} 条新闻，失败 {total_news - successful_news} 条")
+
+def main():
+    # 上海交通大学新闻网站基础URL
+    base_url = "https://news.sjtu.edu.cn/jdyw/index_{i}.html"
+    
+    # 创建爬虫实例
+    crawler = NewsCrawler(base_url, save_dir="corpus")
+    
+    # 爬取第2页到第5页的新闻，使用20个线程
+    crawler.crawl(start_page=2, end_page=50, max_news=500, max_workers=20)
+    
+    print("爬取完成，新闻已保存到 corpus 目录")
+
+if __name__ == "__main__":
+    main()
